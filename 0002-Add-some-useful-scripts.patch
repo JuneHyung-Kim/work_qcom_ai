@@ -1,0 +1,1418 @@
+From b61fc49482ad9eb2db8c33399f88b80bf692c3af Mon Sep 17 00:00:00 2001
+From: "junehyung.kim" <junehyung007@gmail.com>
+Date: Sun, 22 Feb 2026 12:27:14 +0900
+Subject: [PATCH 2/2] Add some useful scripts
+
+---
+ scripts/antigravity/debug_activations.py      | 134 +++++++++
+ scripts/antigravity/debug_decoder.py          | 197 +++++++++++++
+ scripts/antigravity/debug_kv.py               | 147 ++++++++++
+ scripts/antigravity/debug_step2.py            | 203 ++++++++++++++
+ scripts/antigravity/reproduce_issue_v2.py     | 264 ++++++++++++++++++
+ scripts/antigravity/test_app.py               |  53 ++++
+ scripts/antigravity/verify_export.py          | 161 +++++++++++
+ .../antigravity/verify_full_onnx_decode.py    | 133 +++++++++
+ scripts/export_tf_whisper_5s.py               |  43 +++
+ 9 files changed, 1335 insertions(+)
+ create mode 100644 scripts/antigravity/debug_activations.py
+ create mode 100644 scripts/antigravity/debug_decoder.py
+ create mode 100644 scripts/antigravity/debug_kv.py
+ create mode 100644 scripts/antigravity/debug_step2.py
+ create mode 100644 scripts/antigravity/reproduce_issue_v2.py
+ create mode 100644 scripts/antigravity/test_app.py
+ create mode 100644 scripts/antigravity/verify_export.py
+ create mode 100644 scripts/antigravity/verify_full_onnx_decode.py
+ create mode 100644 scripts/export_tf_whisper_5s.py
+
+diff --git a/scripts/antigravity/debug_activations.py b/scripts/antigravity/debug_activations.py
+new file mode 100644
+index 00000000..595b14f8
+--- /dev/null
++++ b/scripts/antigravity/debug_activations.py
+@@ -0,0 +1,134 @@
++import torch
++import numpy as np
++import os
++import sys
++from transformers import WhisperForConditionalGeneration, WhisperProcessor
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++try:
++    from qai_hub_models.models.whisper_small.model import WhisperSmall
++except ImportError:
++    print("QAI Hub Models not found")
++    sys.exit(1)
++
++def debug_activations():
++    torch.manual_seed(42)
++    np.random.seed(42)
++
++    model_id = "openai/whisper-small"
++    print(f"Loading Standard Model: {model_id}")
++    std_model = WhisperForConditionalGeneration.from_pretrained(model_id)
++    processor = WhisperProcessor.from_pretrained(model_id)
++
++    print("Loading QAI WhisperSmall...")
++    qc_model_wrapper = WhisperSmall.from_pretrained()
++    qc_encoder = qc_model_wrapper.encoder
++
++    # -- Config --
++    NEW_MELS = 500
++    NEW_EMB = 250
++    
++    # -- Trim Both --
++    std_model.model.encoder.embed_positions.weight.data = std_model.model.encoder.embed_positions.weight.data[:NEW_EMB, :]
++    std_model.model.encoder.embed_positions.num_embeddings = NEW_EMB
++    std_model.config.max_source_positions = NEW_EMB
++    
++    qc_encoder.encoder.embed_positions = torch.nn.Parameter(
++        qc_encoder.encoder.embed_positions[:NEW_EMB, :]
++    )
++
++    # -- Input --
++    sr = 16000
++    duration = 5
++    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
++    audio = 0.5 * np.sin(2 * np.pi * 440 * t).astype(np.float32)
++    inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
++    input_features_5s = inputs.input_features[:, :, :NEW_MELS]
++
++    # -- Helpers to capture intermediate outputs --
++    activations = {}
++    def get_activation(name):
++        def hook(model, input, output):
++            activations[name] = output
++        return hook
++
++    # Hook Standard
++    # layer_norm is the final LN in Encoder
++    std_model.model.encoder.layer_norm.register_forward_hook(get_activation('std_final_ln'))
++    # conv1
++    std_model.model.encoder.conv1.register_forward_hook(get_activation('std_conv1'))
++    # conv2 
++    std_model.model.encoder.conv2.register_forward_hook(get_activation('std_conv2'))
++
++    # Hook Qc
++    # layer_norm
++    qc_encoder.encoder.layer_norm.register_forward_hook(get_activation('qc_final_ln'))
++    # conv1
++    qc_encoder.encoder.conv1.register_forward_hook(get_activation('qc_conv1'))
++    # conv2
++    qc_encoder.encoder.conv2.register_forward_hook(get_activation('qc_conv2'))
++
++    print("\n--- Running Inference ---")
++    std_model.eval()
++    qc_encoder.eval()
++    
++    with torch.no_grad():
++        std_model.model.encoder(input_features_5s)
++        qc_encoder(input_features_5s)
++
++    def compare(name1, name2, permute_qc=False):
++        if name1 not in activations or name2 not in activations:
++             print(f"MISSING {name1} or {name2}")
++             return
++             
++        a1 = activations[name1]
++        a2 = activations[name2]
++        
++        print(f"Checking {name1} vs {name2}")
++        print(f"  {name1}: {a1.shape}")
++        print(f"  {name2}: {a2.shape}")
++        
++        t1 = a1
++        t2 = a2
++        
++        if permute_qc:
++            # Qc Conv output: (N, C, H, W) -> (1, 80, 1, 500)
++            # Std Conv output: (N, C, L) -> (1, 80, 500)
++            if t2.ndim == 4 and t2.shape[2] == 1:
++                t2 = t2.squeeze(2) # (1, 80, 500)
++            
++            # Check alignment
++            if t1.shape != t2.shape:
++                # Maybe t2 needs transpose?
++                # Conv1: (1, 768, 500) (Std) vs (1, 768, 500) (Qc) theoretically
++                pass
++        else:
++            # Final LN
++            # Std: (1, 250, 768)
++            # Qc: (1, 1, 250, 768)
++             if t2.ndim == 4 and t2.shape[1] == 1:
++                t2 = t2.squeeze(1) # (1, 250, 768)
++
++        if t1.shape != t2.shape:
++             print(f"  SHAPE MISMATCH! {t1.shape} vs {t2.shape}")
++             return
++
++        cos = torch.nn.functional.cosine_similarity(t1.flatten(), t2.flatten(), dim=0)
++        print(f"  Cosine Similarity: {cos.item():.4f}")
++        
++        diff = (t1 - t2).abs().max()
++        print(f"  Max Diff: {diff.item():.4f}")
++
++    # Conv1
++    compare('std_conv1', 'qc_conv1', permute_qc=True)
++    # Conv2
++    compare('std_conv2', 'qc_conv2', permute_qc=True)
++    
++    # Final Layer Norm (Last Hidden State)
++    compare('std_final_ln', 'qc_final_ln')
++
++if __name__ == "__main__":
++    debug_activations()
++
+diff --git a/scripts/antigravity/debug_decoder.py b/scripts/antigravity/debug_decoder.py
+new file mode 100644
+index 00000000..f0fcdc1e
+--- /dev/null
++++ b/scripts/antigravity/debug_decoder.py
+@@ -0,0 +1,197 @@
++import torch
++import numpy as np
++import os
++import sys
++from transformers import WhisperForConditionalGeneration, WhisperProcessor
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++try:
++    from qai_hub_models.models.whisper_small.model import WhisperSmall
++except ImportError:
++    print("QAI Hub Models not found")
++    sys.exit(1)
++
++def debug_decoder():
++    torch.manual_seed(42)
++    np.random.seed(42)
++
++    model_id = "openai/whisper-small"
++    print(f"Loading Standard Model: {model_id}")
++    std_model = WhisperForConditionalGeneration.from_pretrained(model_id, attn_implementation="eager")
++    processor = WhisperProcessor.from_pretrained(model_id)
++
++    print("Loading QAI WhisperSmall...")
++    qc_model_wrapper = WhisperSmall.from_pretrained()
++    qc_encoder = qc_model_wrapper.encoder
++    qc_decoder = qc_model_wrapper.decoder
++
++    # -- Config --
++    NEW_MELS = 500
++    NEW_EMB = 250
++    
++    # -- Trim Both --
++    std_model.model.encoder.embed_positions.weight.data = std_model.model.encoder.embed_positions.weight.data[:NEW_EMB, :]
++    std_model.model.encoder.embed_positions.num_embeddings = NEW_EMB
++    std_model.config.max_source_positions = NEW_EMB
++    
++    qc_encoder.encoder.embed_positions = torch.nn.Parameter(
++        qc_encoder.encoder.embed_positions[:NEW_EMB, :]
++    )
++
++    # -- Input (Real Audio) --
++    from qai_hub_models.utils.asset_loaders import CachedWebModelAsset
++    from qai_hub_models.models._shared.hf_whisper.model import MODEL_ID, MODEL_ASSET_VERSION
++    
++    print("Fetching demo audio...")
++    TEST_AUDIO_PATH = CachedWebModelAsset.from_asset_store(
++        MODEL_ID, MODEL_ASSET_VERSION, "audio/jfk.npz"
++    )
++    TEST_AUDIO_PATH.fetch()
++    with np.load(TEST_AUDIO_PATH.path()) as f:
++        audio = f["audio"]
++        
++    # Trim to 5s
++    sr = 16000
++    audio = audio[:sr*5]
++    
++    inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
++    input_features_5s = inputs.input_features[:, :, :NEW_MELS]
++
++    print("\n--- Running Inference ---")
++    std_model.eval()
++    qc_encoder.eval()
++    qc_decoder.eval()
++    
++    with torch.no_grad():
++        # Standard Encoder
++        std_enc_out = std_model.model.encoder(input_features_5s)
++        std_last_hidden = std_enc_out.last_hidden_state
++        
++        # Qc Encoder
++        qc_enc_out = qc_encoder(input_features_5s)
++        qc_kv_list = qc_enc_out 
++        # kv_cache_cross for Layer 0: qc_kv_list[0] -> (k, v)
++
++    # -- Decoder Inputs --
++    sot_token = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
++    input_ids = torch.tensor([[sot_token]], dtype=torch.int32) # (1, 1)
++    
++    # Helpers for hooking
++    activations = {}
++    def get_activation(name, index=None):
++        def hook(model, input, output):
++            if index is not None:
++                # For SHAAttention, output might be tuple, we want attn_weights or Q?
++                # Q is computed inside. We need to hook the Q projection layers?
++                # SHAAttention has q_proj_sha list.
++                # Hard to hook internal Q without modifying code or hooking submodules.
++                pass
++            activations[name] = output
++        return hook
++
++    # --- Hook Standard Decoder Last Layer (11) Cross Attn ---
++    # Q Proj
++    std_model.model.decoder.layers[11].encoder_attn.q_proj.register_forward_hook(get_activation('std_q_proj_last'))
++    
++    # --- Hook Qc Decoder Last Layer (11) Cross Attn ---
++    qc_last_layer_attn = qc_decoder.decoder.layers[11].encoder_attn
++    qc_last_layer_attn.q_proj_sha[0].register_forward_hook(get_activation('qc_q_proj_last_head0'))
++    
++    print("Running Decode Step 0...")
++    
++    # -- Run Standard Decoder --
++    with torch.no_grad():
++        std_out = std_model(input_features=input_features_5s, decoder_input_ids=torch.tensor([[sot_token]]), output_attentions=True)
++        std_attn_weights_last = std_out.cross_attentions[11] # Layer 11
++        std_logits = std_out.logits # (1, 1, 51865)
++
++    # -- Run Qc Decoder --
++    # Prepare Inputs
++    from qai_hub_models.models._shared.hf_whisper.model import MEAN_DECODE_LEN
++    num_heads = 12
++    head_dim = 64
++    
++    flat_self_caches = []
++    for _ in range(12): 
++        k = torch.zeros(num_heads, 1, head_dim, MEAN_DECODE_LEN - 1)
++        v = torch.zeros(num_heads, 1, MEAN_DECODE_LEN - 1, head_dim)
++        flat_self_caches.extend([k, v])
++        
++    flat_cross_caches = []
++    for layer_cache in qc_kv_list:
++        flat_cross_caches.extend([layer_cache[0], layer_cache[1]])
++    
++    mask_neg = -100.0
++    attention_mask = torch.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=torch.float32)
++    attention_mask[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0
++    position_ids = torch.tensor([0], dtype=torch.int32)
++    
++    decoder_args = [input_ids, attention_mask] + flat_self_caches + flat_cross_caches + [position_ids]
++    
++    with torch.no_grad():
++        qc_logits, _ = qc_decoder(*decoder_args) # qc_logits: (1, 51865, 1, 1)
++
++    # -- Compare Last Layer Q (Head 0) --
++    print("\n--- Comparing Q Last Layer (Head 0) ---")
++    std_q = activations['std_q_proj_last'] 
++    std_q_head0 = std_q.view(1, 1, 12, 64)[:, :, 0, :]
++    scaling = head_dim ** -0.5
++    std_q_head0_scaled = std_q_head0 * scaling
++    
++    qc_q_head0 = activations['qc_q_proj_last_head0']
++    qc_q_head0 = qc_q_head0.squeeze().view(1, 1, 64)
++    
++    cos = torch.nn.functional.cosine_similarity(std_q_head0_scaled.flatten(), qc_q_head0.flatten(), dim=0)
++    diff = (std_q_head0_scaled - qc_q_head0).abs().max()
++    print(f"  Cosine: {cos.item():.4f}")
++    print(f"  Max Diff: {diff.item():.4f}")
++    
++    # -- Compare Last Layer Attn Weights --
++    print("\n--- Compare Last Layer Attn Logits (Head 0) ---")
++    # Kc Last Layer: Layer 11 is index 11.
++    # qc_kv_list[11] -> (k, v)
++    qc_k_last = qc_kv_list[11][0][0] # (1, 64, 250)
++    
++    q_tensor = qc_q_head0.reshape(1, 1, 1, 64)
++    k_tensor = qc_k_last.reshape(1, 1, 64, 250)
++    qc_attn_logits = torch.matmul(q_tensor, k_tensor)
++    qc_attn_probs = torch.nn.functional.softmax(qc_attn_logits, dim=-1).squeeze(0).squeeze(0)
++    
++    std_attn_probs = std_attn_weights_last[:, 0, :, :]
++    
++    cos = torch.nn.functional.cosine_similarity(std_attn_probs.flatten(), qc_attn_probs.flatten(), dim=0)
++    diff = (std_attn_probs - qc_attn_probs).abs().max()
++    print(f"  Probs Cosine: {cos.item():.4f}")
++    print(f"  Probs Max Diff: {diff.item():.4f}")
++    
++    # -- Compare Final Logits --
++    print("\n--- Compare Final Logits ---")
++    # Qc Logits: (1, 51865, 1, 1) -> (1, 1, 51865)
++    # Squeeze last two dims: (1, 51865)
++    # Then unsqueeze(1) -> (1, 1, 51865)
++    qc_logits_flat = qc_logits.squeeze(-1).squeeze(-1).unsqueeze(1) 
++    
++    print(f"  Std Logits Shape: {std_logits.shape}")
++    print(f"  Qc Logits Shape: {qc_logits_flat.shape}")
++    
++    # Flatten for cosine comparison
++    cos = torch.nn.functional.cosine_similarity(std_logits.flatten(), qc_logits_flat.flatten(), dim=0)
++    diff = (std_logits - qc_logits_flat).abs().max()
++    print(f"  Logits Cosine: {cos.item():.4f}")
++    print(f"  Logits Max Diff: {diff.item():.4f}")
++    
++    # Top 5
++    top5_std = torch.topk(std_logits[0, 0, :], 5)
++    top5_qc = torch.topk(qc_logits[0, :, 0, 0], 5)
++    
++    print("  Std Top 5 IDs:", top5_std.indices.tolist())
++    print("  Std Top 5 Probs:", torch.softmax(top5_std.values, dim=0).tolist())
++    
++    print("  Qc Top 5 IDs: ", top5_qc.indices.tolist())
++    print("  Qc Top 5 Probs:", torch.softmax(top5_qc.values, dim=0).tolist())
++
++if __name__ == "__main__":
++    debug_decoder()
++
+diff --git a/scripts/antigravity/debug_kv.py b/scripts/antigravity/debug_kv.py
+new file mode 100644
+index 00000000..dc5a3f57
+--- /dev/null
++++ b/scripts/antigravity/debug_kv.py
+@@ -0,0 +1,147 @@
++import torch
++import numpy as np
++import os
++import sys
++from transformers import WhisperForConditionalGeneration, WhisperProcessor
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++try:
++    from qai_hub_models.models.whisper_small.model import WhisperSmall
++except ImportError:
++    print("QAI Hub Models not found")
++    sys.exit(1)
++
++def debug_kv():
++    torch.manual_seed(42)
++    np.random.seed(42)
++
++    model_id = "openai/whisper-small"
++    print(f"Loading Standard Model: {model_id}")
++    std_model = WhisperForConditionalGeneration.from_pretrained(model_id)
++    processor = WhisperProcessor.from_pretrained(model_id)
++
++    print("Loading QAI WhisperSmall...")
++    qc_model_wrapper = WhisperSmall.from_pretrained()
++    qc_encoder = qc_model_wrapper.encoder
++    qc_decoder = qc_model_wrapper.decoder
++
++    # -- Config --
++    NEW_MELS = 500
++    NEW_EMB = 250
++    
++    # -- Trim Both --
++    std_model.model.encoder.embed_positions.weight.data = std_model.model.encoder.embed_positions.weight.data[:NEW_EMB, :]
++    std_model.model.encoder.embed_positions.num_embeddings = NEW_EMB
++    std_model.config.max_source_positions = NEW_EMB
++    
++    qc_encoder.encoder.embed_positions = torch.nn.Parameter(
++        qc_encoder.encoder.embed_positions[:NEW_EMB, :]
++    )
++
++    # -- Input --
++    sr = 16000
++    duration = 5
++    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
++    audio = 0.5 * np.sin(2 * np.pi * 440 * t).astype(np.float32)
++    inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
++    input_features_5s = inputs.input_features[:, :, :NEW_MELS]
++
++    print("\n--- Running Inference ---")
++    std_model.eval()
++    qc_encoder.eval()
++    
++    with torch.no_grad():
++        # Standard
++        std_enc_out = std_model.model.encoder(input_features_5s)
++        std_last_hidden = std_enc_out.last_hidden_state # (1, 250, 768)
++        
++        # Qc
++        qc_enc_out = qc_encoder(input_features_5s)
++        qc_kv_list = qc_enc_out # tuple of layers
++
++    # -- Compare Layer 0 K/V --
++    print("\n--- Comparing Layer 0 K/V ---")
++    
++    # Standard Projection Logic
++    # layer 0 cross attn
++    std_layer0 = std_model.model.decoder.layers[0]
++    std_k_proj = std_layer0.encoder_attn.k_proj
++    std_v_proj = std_layer0.encoder_attn.v_proj
++    
++    # Project Standard Hidden
++    # input: (1, 250, 768)
++    # output: (1, 250, 768)
++    std_k = std_k_proj(std_last_hidden) 
++    std_v = std_v_proj(std_last_hidden)
++    
++    # Reshape for comparison
++    # HfWhisperAttention._shape: 
++    # tensor.view(bs, -1, self.num_heads, self.head_dim).transpose(1, 2)
++    # -> (1, 250, 12, 64) -> (1, 12, 250, 64)
++    # BUT SHAAttention logic (Qc) does: Permute(0, 2, 1, 3) 
++    # where input was (1, 64, 1, 250). Result (1, 1, 64, 250)
++    # Wait, let's look at Qc Output again.
++    
++    qc_k_layer0 = qc_kv_list[0][0] # (12, 1, 64, 250)
++    qc_v_layer0 = qc_kv_list[0][1] # (12, 1, 64, 250)? V might be permuted differently?
++    
++    # Qc Encoder:
++    # Key: k_proj(hidden).permute(0, 2, 1, 3)
++    # Val: v_proj(hidden).permute(0, 2, 3, 1) <--- DIFF PERMUTE?
++    # Let's check code in model_adaptation.py
++    
++    # Check Qc Output shapes
++    print(f"Qc K Layer 0: {qc_k_layer0.shape}")
++    print(f"Qc V Layer 0: {qc_kv_list[0][1].shape}")
++    
++    # Convert Standard K to match Qc K
++    # Standard: (1, 250, 768)
++    NUM_HEADS = 12
++    HEAD_DIM = 64
++    
++    # Reshape Standard K
++    # (1, 250, 768) -> (1, 250, 12, 64)
++    std_k_reshaped = std_k.view(1, 250, 12, 64)
++    # Target: (12, 1, 64, 250) ? (Heads, Batch, Dim, Seq)
++    # Permute Standard: (2, 0, 3, 1) -> (12, 1, 64, 250)
++    std_k_target = std_k_reshaped.permute(2, 0, 3, 1)
++    
++    # Compare K
++    print("\nComparing KEYS:")
++    cos = torch.nn.functional.cosine_similarity(std_k_target.flatten(), qc_k_layer0.flatten(), dim=0)
++    diff = (std_k_target - qc_k_layer0).abs().max()
++    print(f"  Cosine: {cos.item():.4f}")
++    print(f"  Max Diff: {diff.item():.4f}")
++    
++    # Check V Logic in Qc wrapper
++    # Qc V proj: v_proj(hidden).permute(0, 2, 3, 1).contiguous()
++    # Hidden was (1, 768, 1, 250)
++    # V_proj output (1, 64, 1, 250)
++    # Permute(0, 2, 3, 1) -> (1, 1, 250, 64)
++    # Does that match?
++    # Standard V: (1, 250, 768) -> (1, 250, 12, 64)
++    # Target: (12, 1, 250, 64)
++    # Permute Standard: (2, 0, 1, 3) -> (12, 1, 250, 64)
++    
++    std_v_reshaped = std_v.view(1, 250, 12, 64)
++    std_v_target = std_v_reshaped.permute(2, 0, 1, 3)
++    
++    qc_v_layer0 = qc_kv_list[0][1]
++    
++    print("\nComparing VALUES:")
++    print(f"  Std Target Shape: {std_v_target.shape}")
++    print(f"  Qc Shape: {qc_v_layer0.shape}")
++    
++    if std_v_target.shape == qc_v_layer0.shape:
++        cos = torch.nn.functional.cosine_similarity(std_v_target.flatten(), qc_v_layer0.flatten(), dim=0)
++        diff = (std_v_target - qc_v_layer0).abs().max()
++        print(f"  Cosine: {cos.item():.4f}")
++        print(f"  Max Diff: {diff.item():.4f}")
++    else:
++        print("  Shape Mismatch for Values")
++
++if __name__ == "__main__":
++    debug_kv()
++
+diff --git a/scripts/antigravity/debug_step2.py b/scripts/antigravity/debug_step2.py
+new file mode 100644
+index 00000000..94cade96
+--- /dev/null
++++ b/scripts/antigravity/debug_step2.py
+@@ -0,0 +1,203 @@
++import torch
++import numpy as np
++import os
++import sys
++from transformers import WhisperForConditionalGeneration, WhisperProcessor
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++try:
++    from qai_hub_models.models.whisper_small.model import WhisperSmall
++except ImportError:
++    print("QAI Hub Models not found")
++    sys.exit(1)
++
++def debug_step2():
++    torch.manual_seed(42)
++    np.random.seed(42)
++
++    model_id = "openai/whisper-small"
++    print(f"Loading Standard Model: {model_id}")
++    std_model = WhisperForConditionalGeneration.from_pretrained(model_id, attn_implementation="eager")
++    processor = WhisperProcessor.from_pretrained(model_id)
++
++    print("Loading QAI WhisperSmall...")
++    qc_model_wrapper = WhisperSmall.from_pretrained()
++    qc_encoder = qc_model_wrapper.encoder
++    qc_decoder = qc_model_wrapper.decoder
++
++    # -- Config --
++    NEW_MELS = 500
++    NEW_EMB = 250
++    
++    # -- Trim Both --
++    std_model.model.encoder.embed_positions.weight.data = std_model.model.encoder.embed_positions.weight.data[:NEW_EMB, :]
++    std_model.model.encoder.embed_positions.num_embeddings = NEW_EMB
++    std_model.config.max_source_positions = NEW_EMB
++    
++    qc_encoder.encoder.embed_positions = torch.nn.Parameter(
++        qc_encoder.encoder.embed_positions[:NEW_EMB, :]
++    )
++
++    # -- Input (Real Audio) --
++    from qai_hub_models.utils.asset_loaders import CachedWebModelAsset
++    from qai_hub_models.models._shared.hf_whisper.model import MODEL_ID, MODEL_ASSET_VERSION
++    
++    print("Fetching demo audio...")
++    TEST_AUDIO_PATH = CachedWebModelAsset.from_asset_store(
++        MODEL_ID, MODEL_ASSET_VERSION, "audio/jfk.npz"
++    )
++    TEST_AUDIO_PATH.fetch()
++    with np.load(TEST_AUDIO_PATH.path()) as f:
++        audio = f["audio"]
++    
++    # Trim to 5s
++    sr = 16000
++    audio = audio[:sr*5]
++    inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
++    input_features_5s = inputs.input_features[:, :, :NEW_MELS]
++
++    print("\n--- Running Inference ---")
++    std_model.eval()
++    qc_encoder.eval()
++    qc_decoder.eval()
++    
++    with torch.no_grad():
++        qc_enc_out = qc_encoder(input_features_5s)
++        qc_kv_list = qc_enc_out 
++        
++    sot_token = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
++    
++    # ==========================
++    # STEP 0 (First Pass)
++    # ==========================
++    print("\n>>> STEP 0 <<<")
++    
++    # Qc Inputs Step 0
++    from qai_hub_models.models._shared.hf_whisper.model import MEAN_DECODE_LEN
++    print(f"MEAN_DECODE_LEN: {MEAN_DECODE_LEN}")
++    
++    num_heads = 12
++    head_dim = 64
++    
++    # Self Cache Init
++    flat_self_caches_step0 = []
++    for _ in range(12):
++        flat_self_caches_step0.extend([
++            torch.zeros(num_heads, 1, head_dim, MEAN_DECODE_LEN - 1),
++            torch.zeros(num_heads, 1, MEAN_DECODE_LEN - 1, head_dim)
++        ])
++
++    # Cross Cache
++    flat_cross_caches = []
++    for layer_cache in qc_kv_list:
++        flat_cross_caches.extend([layer_cache[0], layer_cache[1]])
++        
++    input_ids_0 = torch.tensor([[sot_token]], dtype=torch.int32)
++    position_ids_0 = torch.tensor([0], dtype=torch.int32)
++    
++    mask_neg = -100.0
++    attn_mask_0 = torch.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=torch.float32)
++    attn_mask_0[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0
++    
++    args_0 = [input_ids_0, attn_mask_0] + flat_self_caches_step0 + flat_cross_caches + [position_ids_0]
++    
++    with torch.no_grad():
++        out_0 = qc_decoder(*args_0)
++        
++    logits_0 = out_0[0]
++    new_self_cache_tuple_0 = out_0[1]
++    
++    # Check Step 0 Output
++    token_id_0 = torch.argmax(logits_0[0, :, 0, 0]).item()
++    token_str_0 = processor.tokenizer.decode([token_id_0])
++    print(f"Qc Step 0 Prediction: {token_id_0} ('{token_str_0}')") # Should be <|en|>
++    
++    # Flatten Cache for Step 1
++    flat_self_caches_step1 = []
++    for k, v in new_self_cache_tuple_0:
++        flat_self_caches_step1.extend([k, v])
++        
++    # ==========================
++    # Standard Model Step 1 Setup (for comparison)
++    # ==========================
++    # We need to run Standard model up to Step 1 to get "True" Step 1 output
++    # But doing single-step with Standard model manual generation loop is tricky.
++    # Instead, we will feed the sequence [<|sot|>, <|en|>] to the model?
++    # No, that will compute logits for <|en|> (Step 1).
++    
++    input_ids_std_seq = torch.tensor([[sot_token, token_id_0]])
++    
++    with torch.no_grad():
++        std_out_seq = std_model(input_features=input_features_5s, decoder_input_ids=input_ids_std_seq)
++        std_logits_seq = std_out_seq.logits # (1, 2, Vocab)
++        
++    # The last logit corresponds to the prediction for Step 1 (what comes after <|en|>)
++    std_logits_step1 = std_logits_seq[:, -1, :] # (1, Vocab)
++    std_pred_step1 = torch.argmax(std_logits_step1, dim=-1).item()
++    std_str_step1 = processor.tokenizer.decode([std_pred_step1])
++    print(f"Std Step 1 Prediction: {std_pred_step1} ('{std_str_step1}')")
++    
++    # ==========================
++    # STEP 1 (Second Pass)
++    # ==========================
++    print("\n>>> STEP 1 <<<")
++    
++    input_ids_1 = torch.tensor([[token_id_0]], dtype=torch.int32) # <|en|>
++    position_ids_1 = torch.tensor([1], dtype=torch.int32)
++    
++    attn_mask_1 = torch.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=torch.float32)
++    # Unmask History (Step 0)
++    attn_mask_1[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0
++    # Unmask Current (Step 1)
++    attn_mask_1[0, 0, 0, MEAN_DECODE_LEN - 2] = 0.0
++    # Logic: attention_mask[:, :, :, mean_decode_len - n - 1] = 0.0
++    # n=1 (index 1) -> mean_decode_len - 1 - 1 = mean_decode_len - 2.
++    # The mask should allow attending to PREVIOUS positions? 
++    # The self-attention in Qc is handled by `SHAAttention`.
++    # `SHAAttention` likely uses the mask to mask out *future* tokens.
++    # But since cache is used, we only process the current token.
++    # The mask passed to `QcWhisperDecoder` is used in `SHAAttention`.
++    # Let's check `attn_mask_1` logic.
++    
++    args_1 = [input_ids_1, attn_mask_1] + flat_self_caches_step1 + flat_cross_caches + [position_ids_1]
++    
++    with torch.no_grad():
++        out_1 = qc_decoder(*args_1)
++        
++    logits_1 = out_1[0] # (1, Vocab, 1, 1)
++    
++    qc_logits_step1_flat = logits_1.squeeze().unsqueeze(0) # (1, Vocab)
++    qc_pred_step1 = torch.argmax(qc_logits_step1_flat, dim=-1).item()
++    qc_str_step1 = processor.tokenizer.decode([qc_pred_step1])
++    
++    print(f"Qc Step 1 Prediction: {qc_pred_step1} ('{qc_str_step1}')")
++    
++    # -- Compare Logits Step 1 --
++    print("\n--- Compare Step 1 Logits ---")
++    cos = torch.nn.functional.cosine_similarity(std_logits_step1.flatten(), qc_logits_step1_flat.flatten(), dim=0)
++    diff = (std_logits_step1.flatten() - qc_logits_step1_flat.flatten()).abs().max()
++    print(f"  Logits Cosine: {cos.item():.4f}")
++    print(f"  Logits Max Diff: {diff.item():.4f}")
++    
++    # Top 5
++    top5_std = torch.topk(std_logits_step1.flatten(), 5)
++    top5_qc = torch.topk(qc_logits_step1_flat.flatten(), 5)
++    
++    print("  Std Top 5 IDs:", top5_std.indices.tolist())
++    print("  Std Top 5 Probs:", torch.softmax(top5_std.values, dim=0).tolist())
++    
++    print("  Qc Top 5 IDs: ", top5_qc.indices.tolist())
++    print("  Qc Top 5 Probs:", torch.softmax(top5_qc.values, dim=0).tolist())
++    
++    # Check NoSpeech
++    nospeech_id = 50362
++    std_nospeech = torch.softmax(std_logits_step1.flatten(), dim=0)[nospeech_id].item()
++    qc_nospeech = torch.softmax(qc_logits_step1_flat.flatten(), dim=0)[nospeech_id].item()
++    print(f"\n  Std NoSpeech Prob: {std_nospeech:.4f}")
++    print(f"  Qc NoSpeech Prob: {qc_nospeech:.4f}")
++
++if __name__ == "__main__":
++    debug_step2()
++
+diff --git a/scripts/antigravity/reproduce_issue_v2.py b/scripts/antigravity/reproduce_issue_v2.py
+new file mode 100644
+index 00000000..662f456c
+--- /dev/null
++++ b/scripts/antigravity/reproduce_issue_v2.py
+@@ -0,0 +1,264 @@
++import torch
++import numpy as np
++import os
++import sys
++from transformers import WhisperForConditionalGeneration, WhisperProcessor
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++try:
++    from qai_hub_models.models.whisper_small.model import WhisperSmall
++    from qai_hub_models.models._shared.hf_whisper.model import MEAN_DECODE_LEN
++except ImportError:
++    print("QAI Hub Models not found or Import Error")
++    sys.exit(1)
++
++def reproduce():
++    torch.manual_seed(42)
++    np.random.seed(42)
++
++    model_id = "openai/whisper-small"
++    print(f"Loading Standard Model: {model_id}")
++    std_model = WhisperForConditionalGeneration.from_pretrained(model_id)
++    processor = WhisperProcessor.from_pretrained(model_id)
++
++    print("Loading QAI WhisperSmall...")
++    qc_model_wrapper = WhisperSmall.from_pretrained()
++    qc_encoder = qc_model_wrapper.encoder
++    qc_decoder = qc_model_wrapper.decoder
++
++    # -- Configuration --
++    NEW_MELS = 500
++    NEW_EMB = 250
++    
++    # -- Trim Qc Encoder --
++    print(f"Trimming Qc Encoder to {NEW_EMB} positions...")
++    qc_encoder.encoder.embed_positions = torch.nn.Parameter(
++        qc_encoder.encoder.embed_positions[:NEW_EMB, :]
++    )
++
++    # -- Generate Input (Real Audio) --
++    from qai_hub_models.utils.asset_loaders import CachedWebModelAsset
++    from qai_hub_models.models._shared.hf_whisper.model import MODEL_ID, MODEL_ASSET_VERSION
++    
++    print("Fetching demo audio...")
++    TEST_AUDIO_PATH = CachedWebModelAsset.from_asset_store(
++        MODEL_ID, MODEL_ASSET_VERSION, "audio/jfk.npz"
++    )
++    TEST_AUDIO_PATH.fetch()
++    with np.load(TEST_AUDIO_PATH.path()) as f:
++        audio = f["audio"]
++        
++    # Trim to 5s
++    sr = 16000
++    audio = audio[:sr*5]
++    print(f"Audio Shape: {audio.shape}")
++
++    print("Processing audio...")
++    # Process without padding for exact control, or slice features
++    inputs = processor(audio, sampling_rate=sr, return_tensors="pt")
++    input_features = inputs.input_features # (1, 80, 3000) usually padded
++    
++    # Slice to 500 frames
++    input_features_5s = input_features[:, :, :NEW_MELS]
++    print(f"Input Features Shape: {input_features_5s.shape}")
++
++    # -- Trim Standard Model Encoder (to see if it bypasses length check) --
++    print(f"Trimming Standard Encoder to {NEW_EMB} positions...")
++    # Standard HF model: model.encoder.embed_positions (Embedding layer) -> not Conv1D but Embedding
++    # Wait, WhisperEncoder has embed_positions as Embedding(1500, 768)
++    std_model.model.encoder.embed_positions.weight.data = std_model.model.encoder.embed_positions.weight.data[:NEW_EMB, :]
++    std_model.model.encoder.embed_positions.num_embeddings = NEW_EMB
++    std_model.config.max_source_positions = NEW_EMB # Might help
++
++    # -- Run Standard Model --
++    print("\n--- Running Standard Model ---")
++    try:
++        std_model.eval()
++        with torch.no_grad():
++            # Encoder
++            std_enc_out = std_model.model.encoder(input_features_5s)
++            last_hidden_state = std_enc_out.last_hidden_state # (1, 250, 768)
++            print(f"Standard Encoder Out: {last_hidden_state.shape}")
++            
++            # Decoder (Generate)
++            # We use generate() to see full output
++            generated_ids = std_model.generate(input_features=input_features_5s, max_new_tokens=20)
++            transcription_std = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
++            print(f"Standard Transcription: {transcription_std}")
++    except Exception as e:
++        print(f"Standard Model Failed: {e}")
++        # Continue to Qc Model validation
++
++    # -- Run Qc Model --
++    print("\n--- Running Qc Model ---")
++    qc_encoder.eval()
++    qc_decoder.eval()
++    
++    with torch.no_grad():
++        # Encoder
++        # QcEncoder returns (next_cache,)
++        qc_enc_out = qc_encoder(input_features_5s)
++        # qc_enc_out is tuple of (k, v) tensors for each layer (cross cache)
++        kv_cache_cross_list = qc_enc_out 
++        
++        # Verify shape
++        k_shape = kv_cache_cross_list[0][0].shape 
++        print(f"Qc Encoder K Shape: {k_shape}") # Expected (12, 1, 64, 250) or similar
++        
++        # Decoder
++        # Manual decoding loop (greedy)
++        sot_token = processor.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
++        input_ids = torch.tensor([[sot_token]], dtype=torch.int32)
++        
++        # Init Past Key Values (Self)
++        num_layers = qc_decoder.config.decoder_layers
++        num_heads = qc_decoder.config.decoder_attention_heads
++        head_dim = qc_decoder.config.d_model // num_heads
++        
++        # Flatten self caches: k0, v0, k1, v1 ...
++        flat_self_caches = []
++        for _ in range(num_layers):
++            k = torch.zeros(num_heads, 1, head_dim, MEAN_DECODE_LEN - 1)
++            v = torch.zeros(num_heads, 1, MEAN_DECODE_LEN - 1, head_dim)
++            flat_self_caches.extend([k, v])
++            
++        # Flatten cross caches: k0, v0, k1, v1 ... from encoder output
++        flat_cross_caches = []
++        for layer_cache in kv_cache_cross_list:
++            # layer_cache is (k, v)
++            flat_cross_caches.extend([layer_cache[0], layer_cache[1]])
++            
++        position_ids = torch.tensor([0], dtype=torch.int32)
++        
++        # Attention Mask (Self)
++        mask_neg = -100.0
++        attention_mask = torch.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=torch.float32)
++        attention_mask[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0
++        
++        # Step 0
++        # HfWhisperDecoder.forward(*args)
++        # args: input_ids, attention_mask, *self_caches, *cross_caches, position_ids
++        
++        decoder_args = [input_ids, attention_mask] + flat_self_caches + flat_cross_caches + [position_ids]
++        
++        logits, new_cache = qc_decoder(*decoder_args)
++        
++        # Predict
++        pred_id = torch.argmax(logits[0, :, 0, 0]).item()
++        pred_token = processor.tokenizer.decode([pred_id])
++        print(f"Qc First Token ID: {pred_id}")
++        print(f"Qc First Token: '{pred_token}'")
++        
++        # Check NoSpeech
++        nospeech_id = 50362
++        nospeech_prob = torch.softmax(logits[0, :, 0, 0], dim=0)[nospeech_id].item()
++        print(f"Qc NoSpeech Prob: {nospeech_prob:.4f}")
++        
++        # Compare with Standard logits if available (step 1 vs step 1 comparison is hard because std uses generate)
++        # But we can assume if Standard generates text, its prob for nospeech is low.
++
++        print(f"Qc NoSpeech Prob: {nospeech_prob:.4f}")
++
++    # -- Full Generation Loop (Greedy) --
++    print("\n--- Running Greedy Generation Loop (20 tokens) ---")
++    
++    # Reset decoder inputs
++    sot = 50258 # <|startoftranscript|>
++    current_tokens = [sot]
++    
++    # Cache setup (Flat list for ONNX/QcWrapper)
++    # 12 layers * 2 (k,v) = 24 tensors for self
++    # 12 layers * 2 (k,v) = 24 tensors for cross
++    
++    # Self Cache: Init Zeros (NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN-1)
++    mean_decode_len = 224 # From model.py usually
++    num_heads = 12
++    head_dim = 64
++    
++    # Self cache is typically updated in-place or returned new. 
++    # The Qc wrapper "forward" returns (logits, new_self_cache).
++    
++    # Initial Self Cache
++    self_cache = []
++    for _ in range(12):
++        self_cache.extend([
++            torch.zeros(num_heads, 1, head_dim, mean_decode_len - 1),
++            torch.zeros(num_heads, 1, mean_decode_len - 1, head_dim)
++        ])
++    
++    # Cross Cache: From Encoder (Fixed)
++    # kv_cache_cross_list is list of tuples (k, v). Flatten it.
++    cross_cache = []
++    # kv_cache_cross_list was returned by encoder.
++    # Check structure:
++    # If it is ( (k,v), (k,v) ... )
++    for layer_out in kv_cache_cross_list:
++        cross_cache.extend([layer_out[0], layer_out[1]])
++        
++    mask_neg = -100.0
++    attn_mask = torch.full((1, 1, 1, mean_decode_len), mask_neg, dtype=torch.float32)
++    
++    # Loop
++    generated_text_ids = []
++    MAX_NEW = 20
++    
++    for i in range(MAX_NEW):
++        # Input ID: last generated token
++        input_id = torch.tensor([[current_tokens[-1]]], dtype=torch.int32)
++        
++        # Position ID
++        pos_id = torch.tensor([i], dtype=torch.int32)
++        
++        # Attention Mask (Accumulate valid positions)
++        # Init mask outside loop or reusing it
++        # App logic: attention_mask[:, :, :, mean_decode_len - n - 1] = 0.0
++        
++        # correct mask update
++        attn_mask[0, 0, 0, mean_decode_len - i - 1] = 0.0
++        
++        # Arguments
++        # input_ids, attention_mask, *self_caches, *cross_caches, position_ids
++        args = [input_id, attn_mask] + self_cache + cross_cache + [pos_id]
++        
++        with torch.no_grad():
++            out = qc_decoder(*args)
++            
++        
++        # Parse Output
++        # out is (logits, new_self_cache_flat...) usually
++        # The wrapper unpacks it.
++        # HfWhisperDecoder.forward returns: logits, new_cache
++        # new_cache is tuple of 24 tensors (just self cache keys/values)
++        
++        logits = out[0]
++        new_self_cache_tuple = out[1] # Tuple of 12 tuples ( (k,v), (k,v)... )
++        
++        # Update Self Cache for next step (Flatten it!)
++        self_cache = []
++        for layer_k, layer_v in new_self_cache_tuple:
++            self_cache.extend([layer_k, layer_v])
++        
++        # Greedy Decode
++        next_token = torch.argmax(logits[0, :, 0, 0]).item()
++        generated_text_ids.append(next_token)
++        current_tokens.append(next_token)
++        
++        token_str = processor.tokenizer.decode([next_token])
++        print(f"Step {i+1}: {next_token} ('{token_str}')")
++        
++        if next_token == 50257: # EOT
++            break
++            
++    full_text = processor.tokenizer.decode(generated_text_ids)
++    print(f"\nQc Generated Text: {full_text}")
++
++    if "<|nocaptions|>" in full_text:
++        print("\nRESULT: Qc Model FAILED (Predicted <|nocaptions|>)")
++    else:
++        print("\nRESULT: Qc Model SUCCEEDED (Predicted text)")
++
++if __name__ == "__main__":
++    reproduce()
++
+diff --git a/scripts/antigravity/test_app.py b/scripts/antigravity/test_app.py
+new file mode 100644
+index 00000000..3903177d
+--- /dev/null
++++ b/scripts/antigravity/test_app.py
+@@ -0,0 +1,53 @@
++
++import numpy as np
++import torch
++import sys
++import os
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from qai_hub_models.models.whisper_small.model import WhisperSmall
++from qai_hub_models.models._shared.hf_whisper.app import HfWhisperApp
++from qai_hub_models.utils.asset_loaders import CachedWebModelAsset
++from qai_hub_models.models._shared.hf_whisper.model import MODEL_ID, MODEL_ASSET_VERSION
++
++def test_app():
++    print("Loading WhisperSmall...")
++    model = WhisperSmall.from_pretrained()
++    
++    # Init App
++    print("Initializing HfWhisperApp...")
++    app = HfWhisperApp(
++        encoder=model.encoder,
++        decoder=model.decoder,
++        hf_model_id="openai/whisper-small",
++        max_audio_seconds=30 # App defaults to 30 usually, let's keep it default
++    )
++    
++    # Load Audio
++    print("Fetching demo audio...")
++    TEST_AUDIO_PATH = CachedWebModelAsset.from_asset_store(
++        MODEL_ID, MODEL_ASSET_VERSION, "audio/jfk.npz"
++    )
++    TEST_AUDIO_PATH.fetch()
++    with np.load(TEST_AUDIO_PATH.path()) as f:
++        audio = f["audio"]
++        
++    sr = 16000
++    # Trim to 5s
++    audio_5s = audio[:sr*5]
++    print(f"Audio Duration: {len(audio_5s)/sr}s")
++    
++    print("\n--- Running Transcribe ---")
++    text = app.transcribe(audio_5s, audio_sample_rate=sr)
++    print(f"Transcription: '{text}'")
++    
++    if "<|nocaptions|>" in text or not text.strip():
++        print("RESULT: FAILED (Empty or No Captions)")
++    else:
++        print("RESULT: SUCCEEDED")
++
++if __name__ == "__main__":
++    test_app()
++
+diff --git a/scripts/antigravity/verify_export.py b/scripts/antigravity/verify_export.py
+new file mode 100644
+index 00000000..3b299a13
+--- /dev/null
++++ b/scripts/antigravity/verify_export.py
+@@ -0,0 +1,161 @@
++
++import numpy as np
++import torch
++import sys
++import os
++import onnxruntime as ort
++
++# Add path to include qai_hub_models
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from qai_hub_models.models._shared.hf_whisper.model import MODEL_ID, MODEL_ASSET_VERSION
++from qai_hub_models.utils.asset_loaders import CachedWebModelAsset
++from transformers import WhisperProcessor
++
++def verify_export():
++    # PATHS
++    # Assuming user ran export script and output is in default location
++    EXPORT_DIR = "../../calib_out/whisper_small_q_500"
++    ENC_PATH = os.path.join(EXPORT_DIR, "encoder_aimet", "model.onnx")
++    DEC_PATH = os.path.join(EXPORT_DIR, "decoder_aimet", "model.onnx")
++    
++    if not os.path.exists(ENC_PATH):
++        print(f"Error: Encoder ONNX not found at {ENC_PATH}")
++        print("Please run export_whisper_small_quantized_500.py first.")
++        return
++
++    print("Loading ONNX Session...")
++    sess_enc = ort.InferenceSession(ENC_PATH)
++    sess_dec = ort.InferenceSession(DEC_PATH)
++    
++    # Load Audio
++    print("Fetching demo audio...")
++    TEST_AUDIO_PATH = CachedWebModelAsset.from_asset_store(
++        MODEL_ID, MODEL_ASSET_VERSION, "audio/jfk.npz"
++    )
++    TEST_AUDIO_PATH.fetch()
++    with np.load(TEST_AUDIO_PATH.path()) as f:
++        audio = f["audio"]
++        
++    sr = 16000
++    audio_5s = audio[:sr*5]
++    
++    processor = WhisperProcessor.from_pretrained("openai/whisper-small")
++    inputs = processor(audio_5s, sampling_rate=sr, return_tensors="np")
++    input_features_5s = inputs.input_features[:, :, :500].astype(np.float32)
++    
++    print("\n--- Running Encoder ONNX ---")
++    enc_out = sess_enc.run(None, {"input_features": input_features_5s})
++    # enc_out is list of 24 tensors (k, v per layer)
++    
++    print("Encoder Output Shapes:")
++    for i, out in enumerate(enc_out):
++        if i < 2: print(f"  {i}: {out.shape}")
++        
++    # Decoder Step 0
++    print("\n--- Running Decoder ONNX (Step 0) ---")
++    
++    # Prepare Inputs
++    # input_ids, attention_mask, *self_cache_in, *cross_cache_in, position_ids
++    
++    sot = 50258
++    input_ids = np.array([[sot]], dtype=np.int32)
++    position_ids = np.array([0], dtype=np.int32)
++    MEAN_DECODE_LEN = 200 # Constant from model.py for this specific model variant
++    
++    mask_neg = -100.0
++    attn_mask = np.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=np.float32)
++    attn_mask[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0
++    
++    # Self Cache Init (Zeros)
++    num_heads = 12
++    head_dim = 64
++    self_cache_in = []
++    for _ in range(12):
++        self_cache_in.append(np.zeros((num_heads, 1, head_dim, MEAN_DECODE_LEN - 1), dtype=np.float32)) # K
++        self_cache_in.append(np.zeros((num_heads, 1, MEAN_DECODE_LEN - 1, head_dim), dtype=np.float32)) # V
++        
++    # Cross Cache (From Encoder)
++    # Encoder outputs are K (12, 1, 64, 250), V (12, 1, 250, 64). 
++    cross_cache_in = enc_out # Already in correct list order
++    
++    input_feed = {
++        "input_ids": input_ids,
++        "attention_mask": attn_mask,
++        "position_ids": position_ids
++    }
++    
++    # Add Caches
++    # Names must match export script
++    # k_cache_self_{i}_in, v_cache_self_{i}_in
++    # k_cache_cross_{i}, v_cache_cross_{i}
++    
++    for i in range(12):
++        input_feed[f"k_cache_self_{i}_in"] = self_cache_in[2*i]
++        input_feed[f"v_cache_self_{i}_in"] = self_cache_in[2*i+1]
++        
++    for i in range(12):
++        input_feed[f"k_cache_cross_{i}"] = cross_cache_in[2*i]
++        input_feed[f"v_cache_cross_{i}"] = cross_cache_in[2*i+1]
++        
++    outputs = sess_dec.run(None, input_feed)
++    logits = outputs[0]
++    # outputs[1..N] are new self caches (k, v per layer)
++    new_self_caches = outputs[1:]
++    
++    # Decode
++    token_id = np.argmax(logits[0, :, 0, 0])
++    token_str = processor.tokenizer.decode([token_id])
++    print(f"Step 0 Prediction: {token_id} ('{token_str}')")
++    
++    # --- Step 1 ---
++    print("\n--- Running Decoder ONNX (Step 1) ---")
++    
++    # Input ID is previous output
++    input_ids_1 = np.array([[token_id]], dtype=np.int32)
++    position_ids_1 = np.array([1], dtype=np.int32)
++    
++    # Attention Mask
++    # Unmask Current (Step 1) AND History (Step 0)
++    # The mask shape is (1, 1, 1, MEAN_DECODE_LEN)
++    # 0.0 means attend, neg means mask.
++    # MEAN_DECODE_LEN-1 is Step 0 (last pos)
++    # MEAN_DECODE_LEN-2 is Step 1 (current pos)
++    attn_mask_1 = np.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=np.float32)
++    attn_mask_1[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0 # Step 0
++    attn_mask_1[0, 0, 0, MEAN_DECODE_LEN - 2] = 0.0 # Step 1
++    
++    input_feed_1 = {
++        "input_ids": input_ids_1,
++        "attention_mask": attn_mask_1,
++        "position_ids": position_ids_1
++    }
++    
++    # Update Caches
++    # new_self_caches is flat list: k_0, v_0, k_1, v_1 ...
++    # input names: k_cache_self_{i}_in ...
++    
++    for i in range(12):
++        input_feed_1[f"k_cache_self_{i}_in"] = new_self_caches[2*i]
++        input_feed_1[f"v_cache_self_{i}_in"] = new_self_caches[2*i+1]
++        
++    for i in range(12):
++        # reuse cross cache
++        input_feed_1[f"k_cache_cross_{i}"] = cross_cache_in[2*i]
++        input_feed_1[f"v_cache_cross_{i}"] = cross_cache_in[2*i+1]
++        
++    outputs_1 = sess_dec.run(None, input_feed_1)
++    logits_1 = outputs_1[0]
++    
++    token_id_1 = np.argmax(logits_1[0, :, 0, 0])
++    token_str_1 = processor.tokenizer.decode([token_id_1])
++    print(f"Step 1 Prediction: {token_id_1} ('{token_str_1}')")
++    
++    if token_id_1 == 50362 or "<|nocaptions|>" in token_str_1:
++        print("RESULT: FAILED (Predicted <|nocaptions|>)")
++    else:
++        print("RESULT: SUCCEEDED")
++
++if __name__ == "__main__":
++    verify_export()
++
+diff --git a/scripts/antigravity/verify_full_onnx_decode.py b/scripts/antigravity/verify_full_onnx_decode.py
+new file mode 100644
+index 00000000..296a4754
+--- /dev/null
++++ b/scripts/antigravity/verify_full_onnx_decode.py
+@@ -0,0 +1,133 @@
++"""Full greedy decoding test for quantized ONNX encoder+decoder."""
++import numpy as np
++import os
++import sys
++import onnxruntime as ort
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
++
++from qai_hub_models.models._shared.hf_whisper.model import MODEL_ID, MODEL_ASSET_VERSION
++from qai_hub_models.utils.asset_loaders import CachedWebModelAsset
++from transformers import WhisperProcessor
++
++
++def verify_full_decode():
++    EXPORT_DIR = os.path.join(
++        os.path.dirname(__file__),
++        "../../calib_out/whisper_small_q_500",
++    )
++    ENC_PATH = os.path.join(EXPORT_DIR, "encoder_aimet", "model.onnx")
++    DEC_PATH = os.path.join(EXPORT_DIR, "decoder_aimet", "model.onnx")
++
++    if not os.path.exists(ENC_PATH):
++        print(f"Error: Encoder ONNX not found at {ENC_PATH}")
++        return
++
++    print("Loading ONNX Sessions...")
++    sess_enc = ort.InferenceSession(ENC_PATH)
++    sess_dec = ort.InferenceSession(DEC_PATH)
++
++    # Load audio
++    print("Fetching demo audio...")
++    TEST_AUDIO_PATH = CachedWebModelAsset.from_asset_store(
++        MODEL_ID, MODEL_ASSET_VERSION, "audio/jfk.npz"
++    )
++    TEST_AUDIO_PATH.fetch()
++    with np.load(TEST_AUDIO_PATH.path()) as f:
++        audio = f["audio"]
++
++    sr = 16000
++    audio_5s = audio[: sr * 5]
++
++    processor = WhisperProcessor.from_pretrained("openai/whisper-small")
++    inputs = processor(audio_5s, sampling_rate=sr, return_tensors="np")
++    input_features_5s = inputs.input_features[:, :, :500].astype(np.float32)
++
++    # Encoder
++    print("\n--- Encoder ---")
++    enc_out = sess_enc.run(None, {"input_features": input_features_5s})
++    print(f"Encoder outputs: {len(enc_out)} tensors")
++    print(f"  K[0]: {enc_out[0].shape}, V[0]: {enc_out[1].shape}")
++
++    # Decoder greedy loop
++    print("\n--- Full Greedy Decode (max 30 tokens) ---")
++    MEAN_DECODE_LEN = 200
++    num_heads = 12
++    head_dim = 64
++    mask_neg = -100.0
++    MAX_TOKENS = 30
++
++    # Init self cache
++    self_cache = []
++    for _ in range(12):
++        self_cache.append(
++            np.zeros((num_heads, 1, head_dim, MEAN_DECODE_LEN - 1), dtype=np.float32)
++        )
++        self_cache.append(
++            np.zeros((num_heads, 1, MEAN_DECODE_LEN - 1, head_dim), dtype=np.float32)
++        )
++
++    # Cross cache from encoder
++    cross_cache = enc_out
++
++    # Start tokens
++    sot = 50258
++    current_token = sot
++    generated_ids = []
++
++    attn_mask = np.full((1, 1, 1, MEAN_DECODE_LEN), mask_neg, dtype=np.float32)
++
++    for step in range(MAX_TOKENS):
++        input_ids = np.array([[current_token]], dtype=np.int32)
++        position_ids = np.array([step], dtype=np.int32)
++        attn_mask[0, 0, 0, MEAN_DECODE_LEN - step - 1] = 0.0
++
++        input_feed = {
++            "input_ids": input_ids,
++            "attention_mask": attn_mask,
++            "position_ids": position_ids,
++        }
++        for i in range(12):
++            input_feed[f"k_cache_self_{i}_in"] = self_cache[2 * i]
++            input_feed[f"v_cache_self_{i}_in"] = self_cache[2 * i + 1]
++        for i in range(12):
++            input_feed[f"k_cache_cross_{i}"] = cross_cache[2 * i]
++            input_feed[f"v_cache_cross_{i}"] = cross_cache[2 * i + 1]
++
++        outputs = sess_dec.run(None, input_feed)
++        logits = outputs[0]
++        new_self_caches = outputs[1:]
++
++        # Update self cache
++        self_cache = list(new_self_caches)
++
++        # Greedy
++        token_id = int(np.argmax(logits[0, :, 0, 0]))
++        token_str = processor.tokenizer.decode([token_id])
++        generated_ids.append(token_id)
++        current_token = token_id
++
++        print(f"  Step {step}: {token_id:5d}  '{token_str}'")
++
++        if token_id == 50257:  # <|endoftext|>
++            break
++
++    full_text = processor.tokenizer.decode(
++        generated_ids, skip_special_tokens=True
++    )
++    print(f"\n=== ONNX Quantized Transcription ===")
++    print(f"'{full_text}'")
++
++    # Reference: JFK speech first 5s = "And so my fellow Americans, ask not"
++    expected_keywords = ["fellow", "Americans", "ask", "not"]
++    matches = sum(1 for kw in expected_keywords if kw.lower() in full_text.lower())
++    print(f"\nKeyword match: {matches}/{len(expected_keywords)} ({expected_keywords})")
++
++    if matches >= 3:
++        print("RESULT: PASSED - Quantized ONNX model transcription quality OK")
++    else:
++        print("RESULT: FAILED - Transcription does not match expected content")
++
++
++if __name__ == "__main__":
++    verify_full_decode()
+diff --git a/scripts/export_tf_whisper_5s.py b/scripts/export_tf_whisper_5s.py
+new file mode 100644
+index 00000000..e2a02f4b
+--- /dev/null
++++ b/scripts/export_tf_whisper_5s.py
+@@ -0,0 +1,43 @@
++import torch
++import whisper
++import warnings
++
++# Suppress minor warnings
++warnings.filterwarnings("ignore")
++
++def export_whisper_encoder_5s(output_path="whisper_encoder_5s_fp32.onnx"):
++    print("Loading Whisper Small model...")
++    # Load the PyTorch model
++    model = whisper.load_model("small")
++    model.encoder.eval()
++
++    print("Creating dummy input [1, 80, 500]...")
++    # 5 seconds of audio corresponds to 500 frames (10ms per frame)
++    # Whisper expects Mel spectrogram input: [Batch, n_mels, n_frames]
++    dummy_input = torch.randn(1, 80, 500)
++
++    # Truncate positional embedding to match the 5s input (500 frames)
++    # Whisper encoder has a stride of 2, so 500 frames -> 250 embeddings
++    # Original shape: [1500, 384] -> New shape: [250, 384]
++    new_pos_embed = model.encoder.positional_embedding[:250, :]
++    model.encoder.positional_embedding = torch.nn.Parameter(new_pos_embed)
++
++    print(f"Exporting to {output_path}...")
++    try:
++        torch.onnx.export(
++            model.encoder,
++            dummy_input,
++            output_path,
++            input_names=["mels"],
++            output_names=["output_features"],
++            opset_version=14,  # Recommended opset for modern transformers
++            dynamic_axes=None  # Fixed input size
++        )
++        print(f"Successfully exported to {output_path}")
++        return True
++    except Exception as e:
++        print(f"Export failed: {e}")
++        return False
++
++if __name__ == "__main__":
++    export_whisper_encoder_5s()
+-- 
+2.34.1
+
