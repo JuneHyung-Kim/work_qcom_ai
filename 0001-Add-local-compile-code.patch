@@ -1,0 +1,770 @@
+From 877e8b72abe5b114979bcd0a744e1fcda3a3f0fc Mon Sep 17 00:00:00 2001
+From: "junehyung.kim" <junehyung007@gmail.com>
+Date: Tue, 24 Feb 2026 22:46:23 +0900
+Subject: [PATCH] Add local compile code
+
+---
+ scripts/compile_whisper_small_qnn_local.py    | 521 ++++++++++++++++++
+ scripts/export_whisper_small_quantized_500.py | 167 ++++--
+ 2 files changed, 652 insertions(+), 36 deletions(-)
+ create mode 100644 scripts/compile_whisper_small_qnn_local.py
+
+diff --git a/scripts/compile_whisper_small_qnn_local.py b/scripts/compile_whisper_small_qnn_local.py
+new file mode 100644
+index 00000000..90d19461
+--- /dev/null
++++ b/scripts/compile_whisper_small_qnn_local.py
+@@ -0,0 +1,521 @@
++#!/usr/bin/env python3
++"""
++compile_whisper_small_qnn_local.py
++
++AIMET-exported Whisper Small (500-mel / ~5s) 모델을 QNN SDK 2.37 툴체인으로
++로컬 컴파일하여 precompiled_qnn_onnx 포맷 산출물을 생성합니다.
++
++산출물 (AI Hub --target_runtime precompiled_qnn_onnx 와 동일한 포맷)
++-------------------------------------------------------------------
++  <output-dir>/encoder_precompiled/
++      model.onnx   ← AIMET ONNX (그대로 복사; I/O 메타데이터 역할)
++      model.bin    ← QNN HTP 직렬화 컨텍스트 바이너리
++
++  <output-dir>/decoder_precompiled/
++      model.onnx
++      model.bin
++
++컴파일 파이프라인 (encoder / decoder 각각)
++-----------------------------------------
++  [입력] encoder_aimet/model.onnx + model.encodings
++
++  Step 1.  qnn-onnx-converter
++           ONNX + AIMET encodings → QNN 모델 소스
++           출력: _intermediate/model.cpp
++                 _intermediate/model_weights.bin  (파라미터 바이너리, ≠ 최종 model.bin)
++
++  Step 2.  qnn-model-lib-generator
++           .cpp + _weights.bin → 타겟 아키텍처 공유 라이브러리
++           출력: _intermediate/lib/<target>/libmodel.so
++
++  Step 3.  qnn-context-binary-generator  (x86 오프라인 컴파일)
++           libmodel.so → HTP 직렬화 컨텍스트 바이너리
++           출력: _intermediate/model.serialized.bin  (→ 최종 model.bin 으로 복사)
++
++  [출력] model.onnx (복사) + model.bin (컨텍스트 바이너리)
++
++필수 환경
++---------
++  export QNN_SDK_ROOT=/opt/qcom/aistack/qairt/2.37.0.240927
++
++  aarch64-android 타겟 시:
++    Android NDK 가 설치되어 있고 clang cross-toolchain 이 PATH 에 있어야 합니다.
++
++입력 (export_whisper_small_quantized_500.py --skip-compile 으로 생성)
++---------------------------------------------------------------------
++  <output-dir>/encoder_aimet/model.onnx
++  <output-dir>/encoder_aimet/model.encodings
++  <output-dir>/encoder_aimet/model.data    (외부 가중치; 있으면 자동 참조)
++  <output-dir>/decoder_aimet/model.onnx
++  <output-dir>/decoder_aimet/model.encodings
++  <output-dir>/decoder_aimet/model.data
++
++사용법
++------
++  export QNN_SDK_ROOT=/opt/qcom/aistack/qairt/2.37.0.240927
++
++  # 기본 (aarch64-android, QCS6490)
++  python scripts/compile_whisper_small_qnn_local.py \\
++      --output-dir calib_out/whisper_small_q_500
++
++  # 인코더만 (빠른 테스트)
++  python scripts/compile_whisper_small_qnn_local.py \\
++      --output-dir calib_out/whisper_small_q_500 --encoder-only
++
++  # 중간 파일 자동 삭제
++  python scripts/compile_whisper_small_qnn_local.py \\
++      --output-dir calib_out/whisper_small_q_500 --clean
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import shutil
++import subprocess
++import sys
++
++# ---------------------------------------------------------------------------
++# 모델 상수 (export_whisper_small_quantized_500.py 와 반드시 일치)
++# ---------------------------------------------------------------------------
++NEW_MELS_AUDIO_LEN = 500   # mel time-step  (~5 s audio)
++NEW_AUDIO_EMB_LEN  = 250   # 500 / 2 (conv2 stride=2)
++NUM_BLOCKS         = 12
++NUM_HEADS          = 12
++HEAD_DIM           = 768 // NUM_HEADS  # 64
++
++# Whisper Small 최대 디코드 길이.
++# qai_hub_models 가 설치된 환경이면 import, 아니면 Whisper Small 기본값(224) 사용.
++try:
++    from qai_hub_models.models._shared.hf_whisper.model import MEAN_DECODE_LEN
++except ImportError:
++    MEAN_DECODE_LEN = 224
++
++# ---------------------------------------------------------------------------
++# QCS6490 HTP 정보
++# ---------------------------------------------------------------------------
++# QCS6490 (SM7325): Hexagon HTP v69
++HTP_ARCH_VERSION = 69
++SOC_ID_QCS6490   = 1045   # 0x415
++
++# ---------------------------------------------------------------------------
++# 입력 차원 / dtype 정의 (get_encoder/decoder_compile_spec() 과 대응)
++# ---------------------------------------------------------------------------
++
++def encoder_input_dims() -> dict[str, tuple]:
++    return {"input_features": (1, 80, NEW_MELS_AUDIO_LEN)}
++
++
++def encoder_input_dtypes() -> dict[str, str]:
++    # AI Hub --quantize_io 에서 인코더 입력은 uint16
++    return {"input_features": "uint16"}
++
++
++def decoder_input_dims() -> dict[str, tuple]:
++    dims: dict[str, tuple] = {
++        "input_ids":      (1, 1),
++        "attention_mask": (1, 1, 1, MEAN_DECODE_LEN),
++        "position_ids":   (1,),
++    }
++    for i in range(NUM_BLOCKS):
++        dims[f"k_cache_self_{i}_in"] = (NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN - 1)
++        dims[f"v_cache_self_{i}_in"] = (NUM_HEADS, 1, MEAN_DECODE_LEN - 1, HEAD_DIM)
++    for i in range(NUM_BLOCKS):
++        dims[f"k_cache_cross_{i}"] = (NUM_HEADS, 1, HEAD_DIM, NEW_AUDIO_EMB_LEN)
++        dims[f"v_cache_cross_{i}"] = (NUM_HEADS, 1, NEW_AUDIO_EMB_LEN, HEAD_DIM)
++    return dims
++
++
++def decoder_input_dtypes() -> dict[str, str]:
++    dtypes: dict[str, str] = {
++        "input_ids":      "int32",
++        "attention_mask": "uint16",
++        "position_ids":   "int32",
++    }
++    # QCS6490 QNN attention 커널은 self-KV 캐시 입력으로 8-bit 요구
++    # (export 스크립트의 fix_kv_cache_self_bw() 참조)
++    for i in range(NUM_BLOCKS):
++        dtypes[f"k_cache_self_{i}_in"] = "uint8"
++        dtypes[f"v_cache_self_{i}_in"] = "uint8"
++    for i in range(NUM_BLOCKS):
++        dtypes[f"k_cache_cross_{i}"] = "uint16"
++        dtypes[f"v_cache_cross_{i}"] = "uint16"
++    return dtypes
++
++
++# ---------------------------------------------------------------------------
++# 유틸
++# ---------------------------------------------------------------------------
++
++def find_tool(sdk_root: str, name: str) -> str:
++    """QNN SDK 툴 경로 반환. SDK 내에 없으면 PATH 에서 탐색."""
++    path = os.path.join(sdk_root, "bin", "x86_64-linux-clang", name)
++    if os.path.isfile(path):
++        return path
++    fallback = shutil.which(name)
++    if fallback:
++        return fallback
++    raise FileNotFoundError(
++        f"QNN 툴 '{name}' 을 찾을 수 없습니다.\n"
++        f"  예상 경로: {path}\n"
++        f"  QNN_SDK_ROOT={sdk_root}"
++    )
++
++
++def find_lib(sdk_root: str, rel: str) -> str:
++    """SDK 내 라이브러리 절대 경로 반환."""
++    path = os.path.join(sdk_root, rel)
++    if not os.path.isfile(path):
++        raise FileNotFoundError(f"QNN 라이브러리 없음: {path}")
++    return path
++
++
++def run(cmd: list[str], label: str) -> None:
++    print(f"\n  [{label}]")
++    print("  $", " ".join(cmd))
++    sys.stdout.flush()
++    r = subprocess.run(cmd)
++    if r.returncode != 0:
++        print(f"  오류: {label} 실패 (exit {r.returncode})", file=sys.stderr)
++        sys.exit(r.returncode)
++
++
++# ---------------------------------------------------------------------------
++# Step 1 – qnn-onnx-converter
++#   ONNX + AIMET encodings  →  model.cpp + model_weights.bin
++#
++#   NOTE: converter 는 --output_path 로 지정한 .cpp 와 동일 경로에 .bin 을 자동
++#         생성합니다. 이 .bin 은 파라미터(가중치) 바이너리이며,
++#         최종 산출물인 model.bin(컨텍스트 바이너리)과 다릅니다.
++#         혼동을 막기 위해 _intermediate/ 디렉토리 안에서만 관리합니다.
++# ---------------------------------------------------------------------------
++
++def step1_onnx_converter(
++    sdk_root:      str,
++    onnx_path:     str,
++    encodings_path: str,
++    inter_dir:     str,
++    input_dims:    dict[str, tuple],
++    input_dtypes:  dict[str, str],
++) -> tuple[str, str]:
++    """
++    Returns
++    -------
++    (cpp_path, weights_bin_path)
++    """
++    tool = find_tool(sdk_root, "qnn-onnx-converter")
++    os.makedirs(inter_dir, exist_ok=True)
++
++    out_cpp = os.path.join(inter_dir, "model.cpp")
++
++    cmd = [
++        tool,
++        "--input_network", onnx_path,
++        "--output_path",   out_cpp,
++        "--act_bw",        "16",   # w8a16: activation 16-bit
++        "--weight_bw",     "8",    # w8a16: weight 8-bit
++    ]
++
++    if os.path.exists(encodings_path):
++        # AIMET encodings 로 각 텐서의 scale / offset / bw 를 override
++        cmd += ["--quantization_overrides", encodings_path]
++    else:
++        print(f"  경고: encodings 파일 없음 ({encodings_path})", file=sys.stderr)
++
++    # 입력 차원
++    for name, shape in input_dims.items():
++        cmd += ["--input_dim", name, ",".join(str(d) for d in shape)]
++
++    # AI Hub --quantize_io 에 해당: IO 경계 dtype 지정
++    for name, dtype in input_dtypes.items():
++        cmd += ["--input_data_type", name, dtype]
++
++    run(cmd, "qnn-onnx-converter")
++
++    # converter 는 out_cpp 와 동일 경로에 .bin 을 자동 생성
++    weights_bin = out_cpp.replace(".cpp", ".bin")
++    if not os.path.exists(weights_bin):
++        raise FileNotFoundError(f"converter 출력 .bin 없음: {weights_bin}")
++
++    return out_cpp, weights_bin
++
++
++# ---------------------------------------------------------------------------
++# Step 2 – qnn-model-lib-generator
++#   model.cpp + model_weights.bin  →  libmodel.so
++# ---------------------------------------------------------------------------
++
++def step2_model_lib_generator(
++    sdk_root:   str,
++    cpp_path:   str,
++    bin_path:   str,
++    inter_dir:  str,
++    target:     str,
++) -> str:
++    """
++    Returns
++    -------
++    so_path : str
++        <inter_dir>/lib/<target>/libmodel.so
++    """
++    tool    = find_tool(sdk_root, "qnn-model-lib-generator")
++    lib_dir = os.path.join(inter_dir, "lib")
++    os.makedirs(lib_dir, exist_ok=True)
++
++    cmd = [
++        tool,
++        "-c", cpp_path,
++        "-b", bin_path,
++        "-o", lib_dir,
++        "-t", target,
++    ]
++    run(cmd, "qnn-model-lib-generator")
++
++    so_path = os.path.join(lib_dir, target, "libmodel.so")
++    if not os.path.exists(so_path):
++        raise FileNotFoundError(f"컴파일된 .so 없음: {so_path}")
++    return so_path
++
++
++# ---------------------------------------------------------------------------
++# Step 3 – qnn-context-binary-generator  (x86 오프라인)
++#   libmodel.so  →  model.serialized.bin  (→ 최종 model.bin 으로 복사)
++#
++#   libQnnHtpPrepare.so (lib/x86_64-linux-clang/) 를 백엔드로 사용해
++#   실제 QCS6490 기기 없이 x86 호스트에서 오프라인으로 컨텍스트 바이너리 생성.
++# ---------------------------------------------------------------------------
++
++def step3_context_binary_generator(
++    sdk_root:  str,
++    so_path:   str,
++    inter_dir: str,
++) -> tuple[str, str]:
++    """
++    Returns
++    -------
++    (ctx_bin_path, ctx_onnx_path) : tuple[str, str]
++        ctx_bin_path  : 컨텍스트 바이너리 (.bin 또는 .serialized.bin)
++        ctx_onnx_path : QNN ONNX 래퍼 (model.onnx)
++                        qnn-context-binary-generator 가 바이너리와 함께 생성.
++                        이 파일이 최종 산출물의 model.onnx 가 됨.
++                        (AIMET ONNX 와 다름 – QnnContextBinary 커스텀 노드 포함)
++    """
++    tool = find_tool(sdk_root, "qnn-context-binary-generator")
++
++    # x86 오프라인 HTP 컴파일 라이브러리
++    htp_prepare = find_lib(sdk_root, "lib/x86_64-linux-clang/libQnnHtpPrepare.so")
++
++    ctx_dir = os.path.join(inter_dir, "ctx")
++    os.makedirs(ctx_dir, exist_ok=True)
++
++    cmd = [
++        tool,
++        "--backend",          htp_prepare,
++        "--model",            so_path,
++        "--output_dir",       ctx_dir,
++        "--binary_file",      "model",          # 출력: model.serialized.bin 또는 model.bin
++        "--htp_arch_version", str(HTP_ARCH_VERSION),
++        "--soc_id",           str(SOC_ID_QCS6490),
++    ]
++    run(cmd, "qnn-context-binary-generator")
++
++    # ── 컨텍스트 바이너리 탐색 (.bin / .serialized.bin) ──────────────
++    ctx_bin = None
++    for candidate in ("model.serialized.bin", "model.bin"):
++        path = os.path.join(ctx_dir, candidate)
++        if os.path.exists(path):
++            ctx_bin = path
++            break
++    if ctx_bin is None:
++        raise FileNotFoundError(
++            f"컨텍스트 바이너리 없음 ({ctx_dir}/model.serialized.bin 또는 model.bin)\n"
++            "qnn-context-binary-generator 출력 로그를 확인하세요."
++        )
++
++    # ── QNN ONNX 래퍼 탐색 ───────────────────────────────────────────
++    # qnn-context-binary-generator 는 바이너리와 함께 model.onnx (QNN 래퍼) 를 생성.
++    # 이 ONNX 는 AIMET model.onnx 와 다르며, QnnContextBinary 커스텀 노드를 포함해
++    # model.bin 을 로드하고 HTP 에서 실행하는 I/O 래퍼 역할을 합니다.
++    ctx_onnx = os.path.join(ctx_dir, "model.onnx")
++    if not os.path.exists(ctx_onnx):
++        raise FileNotFoundError(
++            f"QNN ONNX 래퍼 없음: {ctx_onnx}\n"
++            "qnn-context-binary-generator 가 model.onnx 를 생성하지 않았습니다.\n"
++            "QNN SDK 2.37 에서 해당 기능을 지원하는지 --help 로 확인하세요."
++        )
++
++    return ctx_bin, ctx_onnx
++
++
++# ---------------------------------------------------------------------------
++# 컴포넌트 파이프라인
++# ---------------------------------------------------------------------------
++
++def compile_component(
++    sdk_root:   str,
++    aimet_dir:  str,
++    out_dir:    str,
++    label:      str,
++    input_dims: dict[str, tuple],
++    input_dtypes: dict[str, str],
++    target:     str,
++    clean:      bool,
++) -> None:
++    """
++    한 컴포넌트(encoder / decoder)의 3-step 컴파일을 수행하고
++    최종 산출물을 out_dir 에 저장합니다.
++
++    out_dir 최종 구조
++    -----------------
++      model.onnx          ← aimet_dir/model.onnx 복사 (I/O 메타데이터)
++      model.bin           ← HTP 직렬화 컨텍스트 바이너리  ← 핵심 산출물
++      _intermediate/      ← 중간 파일 (--clean 으로 삭제 가능)
++        model.cpp
++        model.bin         ← 가중치 파라미터 바이너리 (≠ 최종 model.bin)
++        lib/<target>/libmodel.so
++        ctx/model.serialized.bin
++    """
++    onnx_src = os.path.join(aimet_dir, "model.onnx")
++    enc_src  = os.path.join(aimet_dir, "model.encodings")
++
++    if not os.path.exists(onnx_src):
++        print(f"\n  경고: {onnx_src} 없음 – {label} 건너뜀", file=sys.stderr)
++        return
++
++    print(f"\n{'=' * 64}")
++    print(f"  {label}")
++    print(f"{'=' * 64}")
++
++    inter_dir = os.path.join(out_dir, "_intermediate")
++    os.makedirs(out_dir, exist_ok=True)
++
++    # Step 1
++    cpp_path, weights_bin = step1_onnx_converter(
++        sdk_root, onnx_src, enc_src, inter_dir, input_dims, input_dtypes
++    )
++
++    # Step 2
++    so_path = step2_model_lib_generator(
++        sdk_root, cpp_path, weights_bin, inter_dir, target
++    )
++
++    # Step 3
++    ctx_bin, ctx_onnx = step3_context_binary_generator(sdk_root, so_path, inter_dir)
++
++    # ── 최종 산출물 패키징 ──────────────────────────────────────────
++    # model.onnx : qnn-context-binary-generator 가 생성한 QNN ONNX 래퍼
++    # model.bin  : HTP 직렬화 컨텍스트 바이너리
++    final_onnx = os.path.join(out_dir, "model.onnx")
++    final_bin  = os.path.join(out_dir, "model.bin")
++
++    shutil.copy2(ctx_onnx, final_onnx)
++    shutil.copy2(ctx_bin,  final_bin)
++
++    print(f"\n  [산출물]")
++    print(f"    {final_onnx}")
++    print(f"    {final_bin}  ({os.path.getsize(final_bin) / 1024 / 1024:.1f} MB)")
++
++    if clean:
++        shutil.rmtree(inter_dir, ignore_errors=True)
++        print(f"  [--clean] 중간 파일 삭제: {inter_dir}")
++
++
++# ---------------------------------------------------------------------------
++# Main
++# ---------------------------------------------------------------------------
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description=(
++            "Whisper Small (500-mel) AIMET 모델을 QNN 2.37 로 로컬 컴파일 → "
++            "precompiled_qnn_onnx (model.onnx + model.bin)"
++        )
++    )
++    parser.add_argument(
++        "--output-dir",
++        default="calib_out/whisper_small_q_500",
++        help="AIMET 출력 디렉토리 (encoder_aimet/, decoder_aimet/ 포함). "
++             "기본값: calib_out/whisper_small_q_500",
++    )
++    parser.add_argument(
++        "--qnn-sdk-root",
++        default=os.environ.get("QNN_SDK_ROOT", ""),
++        help="QNN SDK 2.37 루트 경로. 기본값: $QNN_SDK_ROOT",
++    )
++    parser.add_argument(
++        "--target",
++        default="aarch64-android",
++        choices=["aarch64-android", "aarch64-oe-linux-gcc11.2", "x86_64-linux-clang"],
++        help="qnn-model-lib-generator 컴파일 타겟. 기본값: aarch64-android",
++    )
++    parser.add_argument(
++        "--encoder-only",
++        action="store_true",
++        help="인코더만 컴파일",
++    )
++    parser.add_argument(
++        "--decoder-only",
++        action="store_true",
++        help="디코더만 컴파일",
++    )
++    parser.add_argument(
++        "--clean",
++        action="store_true",
++        help="컴파일 완료 후 _intermediate/ 중간 파일 삭제",
++    )
++    args = parser.parse_args()
++
++    if args.encoder_only and args.decoder_only:
++        parser.error("--encoder-only 와 --decoder-only 는 함께 사용할 수 없습니다.")
++
++    if not args.qnn_sdk_root:
++        parser.error(
++            "QNN SDK 경로 없음. 환경변수를 설정하거나 --qnn-sdk-root 를 사용하세요.\n"
++            "  export QNN_SDK_ROOT=/opt/qcom/aistack/qairt/2.37.0.240927"
++        )
++    if not os.path.isdir(args.qnn_sdk_root):
++        parser.error(f"QNN SDK 디렉토리 없음: {args.qnn_sdk_root}")
++
++    print("QNN SDK     :", args.qnn_sdk_root)
++    print("출력 디렉토리:", args.output_dir)
++    print("타겟         :", args.target)
++    print(f"MEAN_DECODE_LEN = {MEAN_DECODE_LEN}")
++
++    # ── Encoder ─────────────────────────────────────────────────────
++    if not args.decoder_only:
++        compile_component(
++            sdk_root    = args.qnn_sdk_root,
++            aimet_dir   = os.path.join(args.output_dir, "encoder_aimet"),
++            out_dir     = os.path.join(args.output_dir, "encoder_precompiled"),
++            label       = "Encoder  →  precompiled_qnn_onnx",
++            input_dims  = encoder_input_dims(),
++            input_dtypes= encoder_input_dtypes(),
++            target      = args.target,
++            clean       = args.clean,
++        )
++
++    # ── Decoder ─────────────────────────────────────────────────────
++    if not args.encoder_only:
++        compile_component(
++            sdk_root    = args.qnn_sdk_root,
++            aimet_dir   = os.path.join(args.output_dir, "decoder_aimet"),
++            out_dir     = os.path.join(args.output_dir, "decoder_precompiled"),
++            label       = "Decoder  →  precompiled_qnn_onnx",
++            input_dims  = decoder_input_dims(),
++            input_dtypes= decoder_input_dtypes(),
++            target      = args.target,
++            clean       = args.clean,
++        )
++
++    print("\n완료. 최종 산출물:")
++    if not args.decoder_only:
++        d = os.path.join(args.output_dir, "encoder_precompiled")
++        print(f"  {d}/model.onnx")
++        print(f"  {d}/model.bin")
++    if not args.encoder_only:
++        d = os.path.join(args.output_dir, "decoder_precompiled")
++        print(f"  {d}/model.onnx")
++        print(f"  {d}/model.bin")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/export_whisper_small_quantized_500.py b/scripts/export_whisper_small_quantized_500.py
+index 77662a7c..b4f40b8a 100644
+--- a/scripts/export_whisper_small_quantized_500.py
++++ b/scripts/export_whisper_small_quantized_500.py
+@@ -103,7 +103,13 @@ def get_decoder_input_spec():
+ 
+ 
+ def get_decoder_compile_spec():
+-    """Quantized spec for AI Hub compile (matches AIMET encodings)."""
++    """Quantized spec for AI Hub compile (matches AIMET encodings).
++
++    k/v_cache_self_*_in are uint8 (not uint16) because QCS6490's QNN backend
++    requires self-attention KV-cache inputs to be 8-bit.  The AIMET w8a16
++    default would produce uint16, so we post-process the encodings with
++    fix_kv_cache_self_bw() after export to align them.
++    """
+     specs = dict(
+         input_ids=((1, 1), "int32"),
+         attention_mask=((1, 1, 1, MEAN_DECODE_LEN), "uint16"),
+@@ -111,11 +117,11 @@ def get_decoder_compile_spec():
+     for i in range(NUM_BLOCKS):
+         specs[f"k_cache_self_{i}_in"] = (
+             (NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN - 1),
+-            "uint16",
++            "uint8",  # QNN requires 8-bit KV-cache; see fix_kv_cache_self_bw()
+         )
+         specs[f"v_cache_self_{i}_in"] = (
+             (NUM_HEADS, 1, MEAN_DECODE_LEN - 1, HEAD_DIM),
+-            "uint16",
++            "uint8",  # QNN requires 8-bit KV-cache; see fix_kv_cache_self_bw()
+         )
+     for i in range(NUM_BLOCKS):
+         specs[f"k_cache_cross_{i}"] = (
+@@ -130,6 +136,38 @@ def get_decoder_compile_spec():
+     return specs
+ 
+ 
++# -- Encoding post-processing --------------------------------------------------
++def fix_kv_cache_self_bw(dec_dir: str, num_blocks: int = NUM_BLOCKS) -> None:
++    """Post-process decoder AIMET encodings: change k/v_cache_self_*_in from bw=16 to bw=8.
++
++    Root cause: AIMET w8a16 assigns ``activation_type=int16`` to ALL activations,
++    including model inputs (because ``model_input.is_input_quantized=True`` in the
++    AIMET config).  This encodes k/v_cache_self_*_in tensors with ``bw=16``
++    (→ uint16), but QCS6490's QNN attention kernel requires these KV-cache inputs
++    to be 8-bit (uint8).  We patch the exported encodings JSON in-place.
++    """
++    import json
++
++    enc_path = os.path.join(dec_dir, "model.encodings")
++    with open(enc_path) as f:
++        enc = json.load(f)
++
++    changed = 0
++    for entry in enc.get("activation_encodings", []):
++        name = entry.get("name", "")
++        if name.startswith(("k_cache_self_", "v_cache_self_")) and name.endswith("_in"):
++            if entry.get("bw") != 8:
++                entry["bw"] = 8
++                changed += 1
++
++    if changed:
++        with open(enc_path, "w") as f:
++            json.dump(enc, f, indent=4)
++        print(f"  [fix_kv_cache_self_bw] Changed {changed} entries: bw 16→8 in {enc_path}")
++    else:
++        print(f"  [fix_kv_cache_self_bw] WARNING: no bw=16 k/v_cache_self entries found in {enc_path}")
++
++
+ # -- Encoder: ONNX export + AIMET quantize ------------------------------------
+ def export_and_quantize_encoder(fp_encoder, calib_mels, output_dir):
+     """
+@@ -237,12 +275,26 @@ def export_and_quantize_decoder(
+     )
+ 
+     # -- Build decoder calibration data via fp encoder --
++    # Run 2 decode steps per audio sample so that k/v_cache_self_*_in receives
++    # real (non-zero) values during calibration.
++    #
++    # Background: the k/v_cache_self_*_in inputs are always zero when only the
++    # first (SOT) decoding step is used, because there is no prior KV cache.
++    # AIMET then computes a near-degenerate quantizer (scale ≈ 1.5e-7, offset=0)
++    # which is completely wrong for real inference values (~[-2, 2]).
++    # By running a second step we feed the step-0 KV outputs back as step-1
++    # inputs, giving AIMET real values to calibrate the quantizer range.
+     n = min(num_decoder_calib, len(calib_mels))
+-    print(f"  Generating decoder calibration data ({n} samples via fp encoder) ...")
++    calib_steps = 2  # step 0 (zeros) + step 1 (real KV from step 0)
++    print(
++        f"  Generating decoder calibration data "
++        f"({n} audio samples × {calib_steps} decode steps = {n * calib_steps} total) ..."
++    )
+     input_names = [inp.name for inp in quant_sim.session.get_inputs()]
+ 
+     calib_data = []
+     fp_encoder.eval()
++    fp_decoder.eval()
+     with torch.no_grad():
+         for i in range(n):
+             mel_tensor = torch.from_numpy(calib_mels[i])  # (1, 80, 500)
+@@ -251,38 +303,75 @@ def export_and_quantize_decoder(
+             #   v: (NUM_HEADS, 1, 250, HEAD_DIM)
+             encoder_out = fp_encoder(mel_tensor)
+ 
+-            sample: dict[str, np.ndarray] = {}
+-
+-            # Token: SOT
+-            sample["input_ids"] = np.array([[SOT_TOKEN_ID]], dtype=np.int32)
+-
+-            # Causal attention mask: first decoding step -> attend only to
+-            # the last position (current token appended after 199-len KV cache)
+-            attn_mask = np.full(
+-                (1, 1, 1, MEAN_DECODE_LEN), MASK_NEG, dtype=np.float32
+-            )
+-            attn_mask[0, 0, 0, MEAN_DECODE_LEN - 1] = 0.0
+-            sample["attention_mask"] = attn_mask
+-
+-            # Self-attn KV cache: zeros (no previously decoded tokens)
+-            for j in range(NUM_BLOCKS):
+-                sample[f"k_cache_self_{j}_in"] = np.zeros(
+-                    (NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN - 1), dtype=np.float32
+-                )
+-                sample[f"v_cache_self_{j}_in"] = np.zeros(
+-                    (NUM_HEADS, 1, MEAN_DECODE_LEN - 1, HEAD_DIM), dtype=np.float32
++            # Cross-attn caches are constant across all decode steps
++            cross_k = [encoder_out[j][0].cpu() for j in range(NUM_BLOCKS)]
++            cross_v = [encoder_out[j][1].cpu() for j in range(NUM_BLOCKS)]
++
++            # Self-attn KV cache starts as zeros (no prior decoded tokens)
++            self_k = [
++                torch.zeros(NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN - 1)
++                for _ in range(NUM_BLOCKS)
++            ]
++            self_v = [
++                torch.zeros(NUM_HEADS, 1, MEAN_DECODE_LEN - 1, HEAD_DIM)
++                for _ in range(NUM_BLOCKS)
++            ]
++
++            for step in range(calib_steps):
++                sample: dict[str, np.ndarray] = {}
++
++                # Token: SOT (same token for every calibration step)
++                sample["input_ids"] = np.array([[SOT_TOKEN_ID]], dtype=np.int32)
++
++                # Causal attention mask: unmask the last (step+1) positions so
++                # the model can attend to all cached tokens up to the current one.
++                attn_mask = np.full(
++                    (1, 1, 1, MEAN_DECODE_LEN), MASK_NEG, dtype=np.float32
+                 )
+-
+-            # Cross-attn KV cache from encoder output
+-            for j in range(NUM_BLOCKS):
+-                sample[f"k_cache_cross_{j}"] = encoder_out[j][0].cpu().numpy()
+-                sample[f"v_cache_cross_{j}"] = encoder_out[j][1].cpu().numpy()
+-
+-            sample["position_ids"] = np.array([0], dtype=np.int32)
+-
+-            # Reorder to match ONNX session input order
+-            ordered = {name: sample[name] for name in input_names}
+-            calib_data.append(ordered)
++                attn_mask[0, 0, 0, MEAN_DECODE_LEN - 1 - step :] = 0.0
++                sample["attention_mask"] = attn_mask
++
++                # Self-attn KV cache: zeros at step 0, real values at step 1+
++                for j in range(NUM_BLOCKS):
++                    sample[f"k_cache_self_{j}_in"] = self_k[j].numpy()
++                    sample[f"v_cache_self_{j}_in"] = self_v[j].numpy()
++
++                # Cross-attn KV cache from encoder output
++                for j in range(NUM_BLOCKS):
++                    sample[f"k_cache_cross_{j}"] = cross_k[j].numpy()
++                    sample[f"v_cache_cross_{j}"] = cross_v[j].numpy()
++
++                sample["position_ids"] = np.array([step], dtype=np.int32)
++
++                # Reorder to match ONNX session input order
++                ordered = {name: sample[name] for name in input_names}
++                calib_data.append(ordered)
++
++                # Run the FP decoder to obtain the next step's self-KV cache.
++                # HfWhisperDecoder.forward() expects *args in this order:
++                #   input_ids, attention_mask,
++                #   k_self_0, v_self_0, ..., k_self_11, v_self_11,
++                #   k_cross_0, v_cross_0, ..., k_cross_11, v_cross_11,
++                #   position_ids
++                dec_args = [
++                    torch.tensor(sample["input_ids"]),
++                    torch.tensor(sample["attention_mask"]),
++                ]
++                for j in range(NUM_BLOCKS):
++                    dec_args.append(self_k[j])
++                    dec_args.append(self_v[j])
++                for j in range(NUM_BLOCKS):
++                    dec_args.append(cross_k[j])
++                    dec_args.append(cross_v[j])
++                dec_args.append(torch.tensor([step], dtype=torch.int32))
++
++                _, kv_new = fp_decoder(*dec_args)
++                # kv_new: tuple of (k, v) per layer;
++                #   k.shape = (NUM_HEADS, 1, HEAD_DIM, MEAN_DECODE_LEN-1)
++                #   v.shape = (NUM_HEADS, 1, MEAN_DECODE_LEN-1, HEAD_DIM)
++                for j in range(NUM_BLOCKS):
++                    self_k[j] = kv_new[j][0].detach()
++                    self_v[j] = kv_new[j][1].detach()
+ 
+     # -- Calibrate --
+     print(f"  Calibrating decoder with {len(calib_data)} samples ...")
+@@ -292,6 +381,12 @@ def export_and_quantize_decoder(
+     quant_sim.export(dec_dir, "model")
+     print(f"  AIMET exported -> {dec_dir}/model.onnx + model.encodings")
+ 
++    # -- Fix k/v_cache_self_*_in bit-width: 16 -> 8 --
++    # AIMET w8a16 encodes all activations (including model inputs) as bw=16,
++    # but QCS6490's QNN attention kernel requires the self-KV cache inputs to
++    # be uint8.  Patch the encodings JSON before handing it to AI Hub.
++    fix_kv_cache_self_bw(dec_dir)
++
+     if os.path.exists(raw_onnx):
+         os.remove(raw_onnx)
+ 
+@@ -342,7 +437,7 @@ def compile_on_hub(output_dir):
+             input_specs=input_spec,
+             device=device,
+             name=job_name,
+-            options="--target_runtime precompiled_qnn_onnx --qairt_version 2.37 --quantize_io",
++            options="--target_runtime precompiled_qnn_onnx --qairt_version 2.41 --quantize_io",
+         )
+         print(f"    -> {compile_job.url}")
+ 
+-- 
+2.34.1
+
